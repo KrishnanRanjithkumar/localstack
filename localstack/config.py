@@ -87,9 +87,11 @@ class Directories:
     @staticmethod
     def from_config():
         """Returns Localstack directory paths from the config/environment variables defined by the config."""
+        # Note that the entries should be unique, as further downstream in docker_utils.py we're removing
+        # duplicate host paths in the volume mounts via `dict(mount_volumes)`.
         return Directories(
             static_libs=INSTALL_DIR_INFRA,
-            var_libs=TMP_FOLDER,  # TODO: add variable
+            var_libs=VAR_LIBS_DIR,
             cache=CACHE_DIR,
             tmp=TMP_FOLDER,  # TODO: should inherit from root value for /var/lib/localstack (e.g., MOUNT_ROOT)
             functions=HOST_TMP_FOLDER,  # TODO: rename variable/consider a volume
@@ -293,8 +295,10 @@ if TMP_FOLDER.startswith("/var/folders/") and os.path.exists("/private%s" % TMP_
 # temporary folder of the host (required when running in Docker). Fall back to local tmp folder if not set
 HOST_TMP_FOLDER = os.environ.get("HOST_TMP_FOLDER", TMP_FOLDER)
 
-# ephemeral cache dir that persists over reboots
+# ephemeral cache dir that persists across reboots
 CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(TMP_FOLDER, "cache")).strip()
+# libs cache dir that persists across reboots
+VAR_LIBS_DIR = os.environ.get("VAR_LIBS_DIR", os.path.join(TMP_FOLDER, "var_libs")).strip()
 
 # whether to enable verbose debug logging
 LS_LOG = eval_log_type("LS_LOG")
@@ -633,6 +637,7 @@ CONFIG_ENV_VARS = [
     "S3_SKIP_SIGNATURE_VALIDATION",
     "SERVICES",
     "SKIP_INFRA_DOWNLOADS",
+    "SQS_PORT_EXTERNAL",
     "STEPFUNCTIONS_LAMBDA_ENDPOINT",
     "SYNCHRONOUS_API_GATEWAY_EVENTS",
     "SYNCHRONOUS_DYNAMODB_EVENTS",
@@ -752,12 +757,15 @@ def populate_configs(service_ports=None):
 
 
 def service_port(service_key):
+    service_key = service_key.lower()
     if FORWARD_EDGE_INMEM:
         if service_key == "elasticsearch":
             # TODO Elasticsearch domains are a special case - we do not want to route them through
             #  the edge service, as that would require too many route mappings. In the future, we
             #  should integrate them with the port range for external services (4510-4530)
             return SERVICE_PORTS.get(service_key, 0)
+        if service_key == "sqs" and SQS_PORT_EXTERNAL:
+            return SQS_PORT_EXTERNAL
         return get_edge_port_http()
     return SERVICE_PORTS.get(service_key, 0)
 

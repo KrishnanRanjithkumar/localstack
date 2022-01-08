@@ -13,8 +13,10 @@ from six.moves.urllib.parse import urlencode
 
 from localstack import config
 from localstack.constants import TEST_AWS_ACCESS_KEY_ID, TEST_AWS_SECRET_ACCESS_KEY
-from localstack.utils.common import get_service_protocol, poll_condition, short_uid
+from localstack.utils.aws import aws_stack
+from localstack.utils.common import get_service_protocol, poll_condition, retry, short_uid
 
+from .fixtures import only_localstack
 from .lambdas import lambda_integration
 from .test_lambda import LAMBDA_RUNTIME_PYTHON36, TEST_LAMBDA_LIBS, TEST_LAMBDA_PYTHON
 
@@ -359,6 +361,30 @@ class TestSqsProvider:
         batch.append({"Id": "9", "MessageBody": "\x01"})
         result_send = sqs_client.send_message_batch(QueueUrl=queue_url, Entries=batch)
         assert len(result_send["Failed"]) == 1
+
+    @only_localstack
+    def test_external_hostname(self, monkeypatch, sqs_client, sqs_create_queue):
+        external_host = "external-host"
+        external_port = "12345"
+        SQS_PORT_EXTERNAL = "SQS_PORT_EXTERNAL"
+
+        monkeypatch.setattr(config, SQS_PORT_EXTERNAL, external_port)
+        monkeypatch.setattr(config, "HOSTNAME_EXTERNAL", external_host)
+        # TODO: remove once the old provider is discontinued
+        from localstack.services.sqs import sqs_listener as old_sqs_listener
+
+        monkeypatch.setattr(old_sqs_listener, SQS_PORT_EXTERNAL, external_port)
+
+        queue_name = f"queue-{short_uid()}"
+        queue_url = sqs_create_queue(QueueName=queue_name)
+
+        assert f"{external_host}:{external_port}" in queue_url
+
+        message_body = "external_host_test"
+        sqs_client.send_message(QueueUrl=queue_url, MessageBody=message_body)
+
+        receive_result = sqs_client.receive_message(QueueUrl=queue_url)
+        assert receive_result["Messages"][0]["Body"] == message_body
 
     def test_list_queue_tags(self, sqs_client, sqs_create_queue):
         queue_name = f"queue-{short_uid()}"
@@ -835,9 +861,8 @@ class TestSqsProvider:
 
         # create arn
         url_parts = dl_queue_url.split("/")
-        region = os.environ.get("AWS_DEFAULT_REGION") or TEST_REGION
-        dl_target_arn = "arn:aws:sqs:{}:{}:{}".format(
-            region, url_parts[len(url_parts) - 2], url_parts[-1]
+        dl_target_arn = aws_stack.sqs_queue_arn(
+            url_parts[-1], account_id=url_parts[len(url_parts) - 2]
         )
 
         policy = {"deadLetterTargetArn": dl_target_arn, "maxReceiveCount": 1}
@@ -859,6 +884,57 @@ class TestSqsProvider:
             sqs_client.receive_message(QueueUrl=dl_queue_url)["Messages"][0]["MessageId"]
             == result_send["MessageId"]
         )
+
+    @pytest.mark.skipif(
+        os.environ.get("PROVIDER_OVERRIDE_SQS") != "asf", reason="Currently fails for moto provider"
+    )
+    def test_dead_letter_queue_chain(self, sqs_client, sqs_create_queue):
+        # test a chain of 3 queues, with DLQ flow q1 -> q2 -> q3
+
+        # create queues
+        queue_names = [f"q-{short_uid()}", f"q-{short_uid()}", f"q-{short_uid()}"]
+        for queue_name in queue_names:
+            sqs_create_queue(QueueName=queue_name, Attributes={"VisibilityTimeout": "0"})
+        queue_urls = [aws_stack.get_sqs_queue_url(queue_name) for queue_name in queue_names]
+
+        # set redrive policies
+        for idx, queue_name in enumerate(queue_names[:2]):
+            policy = {
+                "deadLetterTargetArn": aws_stack.sqs_queue_arn(queue_names[idx + 1]),
+                "maxReceiveCount": 1,
+            }
+            sqs_client.set_queue_attributes(
+                QueueUrl=queue_urls[idx],
+                Attributes={"RedrivePolicy": json.dumps(policy), "VisibilityTimeout": "0"},
+            )
+
+        def _retry_receive(q_url):
+            def _receive():
+                _result = sqs_client.receive_message(QueueUrl=q_url)
+                assert _result.get("Messages")
+                return _result
+
+            return retry(_receive, sleep=1, retries=5)
+
+        # send message
+        result = sqs_client.send_message(QueueUrl=queue_urls[0], MessageBody="test")
+        # retrieve message from q1
+        result = _retry_receive(queue_urls[0])
+        assert len(result.get("Messages")) == 1
+        # Wait for VisibilityTimeout to expire
+        time.sleep(1.1)
+        # retrieve message from q1 again -> no message, should go to DLQ q2
+        result = sqs_client.receive_message(QueueUrl=queue_urls[0])
+        assert not result.get("Messages")
+        # retrieve message from q2
+        result = _retry_receive(queue_urls[1])
+        assert len(result.get("Messages")) == 1
+        # retrieve message from q2 again -> no message, should go to DLQ q3
+        result = sqs_client.receive_message(QueueUrl=queue_urls[1])
+        assert not result.get("Messages")
+        # retrieve message from q3
+        result = _retry_receive(queue_urls[2])
+        assert len(result.get("Messages")) == 1
 
     # TODO: check if test_set_queue_attribute_at_creation == test_create_queue_with_attributes
 
