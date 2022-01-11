@@ -60,6 +60,18 @@ SKIP_PERSISTENCE_ACTIONS = [
     "Unsubscribe",
 ]
 
+SNS_PROTOCOLS = [
+    "http",
+    "https",
+    "email",
+    "email-json",
+    "sms",
+    "sqs",
+    "application",
+    "lambda",
+    "firehose",
+]
+
 
 class SNSBackend(RegionBackend):
     # maps topic ARN to list of subscriptions
@@ -147,6 +159,13 @@ class ProxyListenerSNS(PersistingProxyListener):
             elif req_action == "Subscribe":
                 if "Endpoint" not in req_data:
                     return make_error(message="Endpoint not specified in subscription", code=400)
+
+                if req_data["Protocol"][0] not in SNS_PROTOCOLS:
+                    return make_error(
+                        message=f"Invalid parameter: Amazon SNS does not support this protocol string: "
+                        f"{req_data['Protocol'][0]}",
+                        code=400,
+                    )
 
                 if ".fifo" in req_data["Endpoint"][0] and ".fifo" not in topic_arn:
                     return make_error(
@@ -613,7 +632,7 @@ async def message_to_subscriber(
             sns_error_to_dead_letter_queue(subscriber["SubscriptionArn"], req_data, str(exc))
         return
 
-    elif subscriber["Protocol"] == "email":
+    elif subscriber["Protocol"] in ["email", "email-json"]:
         ses_client = aws_stack.connect_to_service("ses")
         if subscriber.get("Endpoint"):
             ses_client.verify_email_address(EmailAddress=subscriber.get("Endpoint"))
@@ -622,7 +641,15 @@ async def message_to_subscriber(
             ses_client.send_email(
                 Source="admin@localstack.com",
                 Message={
-                    "Body": {"Text": {"Data": message}},
+                    "Body": {
+                        "Text": {
+                            "Data": create_sns_message_body(
+                                subscriber=subscriber, req_data=req_data, message_id=message_id
+                            )
+                            if subscriber["Protocol"] == "email-json"
+                            else message
+                        }
+                    },
                     "Subject": {"Data": "SNS-Subscriber-Endpoint"},
                 },
                 Destination={"ToAddresses": [subscriber.get("Endpoint")]},
