@@ -3,15 +3,17 @@
 *.class
 *.log
 *.iml
+.coverage.*
+htmlcov
 
 /infra/
 localstack/infra/
-localstack/ext/java/.factorypath
 
 /node_modules/
 package-lock.json
 /nosetests.xml
 
+venv
 /.venv*
 /.coverage
 .settings/
@@ -45,7 +47,12 @@ requirements.copy.txt
 *.tfstate
 *.tfstate.*
 *tfplan
+*.terraform.lock.hcl
 
 .python-version
 
 venv
+api_states
+
+/integration/lambdas/golang/handler.zip
+/tests/integration/lambdas/golang/handler.zip
